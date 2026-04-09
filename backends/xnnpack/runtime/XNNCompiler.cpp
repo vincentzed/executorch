@@ -184,11 +184,28 @@ const uint8_t* getConstantDataPtr(
     if (!constant_data_ptr) {
       // TODO(T172265611): Remove constant_buffer in flatbuffer path after BC
       // window
-      const auto& constant_buffer = *flatbuffer_graph->constant_buffer();
+      auto* cb = flatbuffer_graph->constant_buffer();
+      if (cb == nullptr || buffer_idx >= cb->size()) {
+        ET_LOG(
+            Error,
+            "Invalid buffer_idx %u for constant_buffer of size %u",
+            buffer_idx,
+            cb ? cb->size() : 0);
+        return nullptr;
+      }
+      const auto& constant_buffer = *cb;
       return constant_buffer[buffer_idx]->storage()->data();
     } else {
-      ConstantDataOffsetPtr constant_data_offset =
-          flatbuffer_graph->constant_data()->Get(buffer_idx);
+      auto* cd = flatbuffer_graph->constant_data();
+      if (cd == nullptr || buffer_idx >= cd->size()) {
+        ET_LOG(
+            Error,
+            "Invalid buffer_idx %u for constant_data of size %u",
+            buffer_idx,
+            cd ? cd->size() : 0);
+        return nullptr;
+      }
+      ConstantDataOffsetPtr constant_data_offset = cd->Get(buffer_idx);
       uint64_t offset = constant_data_offset->offset();
 
       bool has_named_key = flatbuffers::IsFieldPresent(
