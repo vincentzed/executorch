@@ -31,6 +31,7 @@ _LFM2_5_VL_TO_META: dict[str, str] = {
     "model.language_model.layers.{}.feed_forward.w3.weight": "layers.{}.feed_forward.w3.weight",
     "model.language_model.layers.{}.conv.conv.weight": "layers.{}.conv.conv.weight",
     "model.language_model.layers.{}.conv.out_proj.weight": "layers.{}.conv.out_proj.weight",
+    "model.language_model.lm_head.weight": "output.weight",
 }
 
 _IN_PROJ_SPLITS = ("B_proj", "C_proj", "x_proj")

@@ -26,8 +26,6 @@ from __future__ import annotations
 import logging
 from argparse import ArgumentParser
 from pathlib import Path
-from typing import Optional
-
 import torch
 from torch.export import Dim, ExportedProgram
 from torch.nn.attention import SDPBackend
@@ -221,7 +219,7 @@ def export_all(
     )
 
     output_path = Path(output)
-    output_dir = output_path.parent or Path(".")
+    output_dir = output_path.parent
     logging.info("Saving %s", output_path)
     with open(output_path, "wb") as f:
         et_program.write_to_file(f)
