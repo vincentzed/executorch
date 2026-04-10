@@ -8,14 +8,18 @@ from torch import nn
 
 
 class ShortConv(nn.Module):
-    """Depthwise short convolution with explicit state IO.
+    """Depthwise short convolution with dual state management.
 
-    Conv state is passed in and returned rather than stored as a mutable
-    buffer, making the module compatible with AOTI tracing.
+    Supports two modes:
+      1. State-as-IO: caller passes conv_state in and receives new state back.
+         Required for AOTI which cannot re-trace mutable buffer mutations.
+      2. Internal buffer: uses register_buffer + copy_() for XNNPack/portable
+         backends where mutable buffers are handled natively.
     """
 
     def __init__(self, dim: int, L_cache: int = 3, *, bias: bool = False) -> None:
         super().__init__()
+        assert L_cache == 3, f"Manual depthwise conv only supports L_cache=3, got {L_cache}"
         self.dim = dim
         self.L_cache = L_cache
 
@@ -25,15 +29,16 @@ class ShortConv(nn.Module):
         self.x_proj = nn.Linear(dim, dim, bias=bias)
         self.out_proj = nn.Linear(dim, dim, bias=bias)
 
+        self.register_buffer(
+            "conv_state",
+            torch.zeros(1, dim, L_cache - 1),
+        )
+
     def forward(
         self, x: torch.Tensor, conv_state: torch.Tensor | None = None
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if conv_state is None:
-            conv_state = torch.zeros(
-                1, self.dim, self.L_cache - 1,
-                dtype=self.conv.weight.dtype,
-                device=self.conv.weight.device,
-            )
+            conv_state = self.conv_state
 
         B = self.B_proj(x).transpose(-1, -2)
         C = self.C_proj(x).transpose(-1, -2)
@@ -67,6 +72,7 @@ class ShortConvBlock(nn.Module):
         freqs_sin: torch.Tensor | None = None,
         attn_options: ForwardOptions | None = None,
     ) -> tuple[torch.Tensor, dict]:
+        # State-as-IO: read from attn_options if provided (CUDA/AOTI path)
         conv_state = None
         if attn_options is not None:
             conv_states = attn_options.get("conv_states")
@@ -77,15 +83,20 @@ class ShortConvBlock(nn.Module):
         h = x + h
         out = h + self.feed_forward(self.ffn_norm(h))
 
+        # Write back state
         update: dict = {}
         if attn_options is not None and "conv_states" in attn_options:
-            # Write back in-place if conv_state is a persistent buffer
             if conv_state is not None:
                 conv_state.copy_(new_conv_state)
             states = dict(attn_options["conv_states"])
             states[self.layer_idx] = new_conv_state
             update["conv_states"] = states
+        else:
+            # XNNPack/portable path: persist via internal buffer
+            with torch.no_grad():
+                self.conv.conv_state.copy_(new_conv_state)
+
         return out, update
 
     def reset_cache(self) -> None:
-        pass
+        self.conv.conv_state.zero_()
