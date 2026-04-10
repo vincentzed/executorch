@@ -104,7 +104,7 @@ class Lfm2p5VlModel(EagerModelBase):
         use_kv_cache: bool = True,
         max_seq_len: int = MAX_SEQ_LEN,
         max_context_len: int = MAX_SEQ_LEN,
-        model_dir: str = "LiquidAI/LFM2-VL-1.6B",
+        model_dir: str = "LiquidAI/LFM2.5-VL-1.6B",
         params_path: str | None = None,
     ) -> None:
         self.use_sdpa_with_kv_cache_op = use_sdpa_with_kv_cache_op
