@@ -183,12 +183,10 @@ class Lfm2p5VlModel(EagerModelBase):
     def __init__(
         self,
         use_sdpa_with_kv_cache_op: bool = True,
+        use_kv_cache: bool = True,
         max_seq_len: int = MAX_SEQ_LEN,
         max_context_len: int = MAX_SEQ_LEN,
-        # HF auto-load path (model ID or local dir containing the full VL checkpoint)
         model_dir: str = "LiquidAI/LFM2-VL-1.6B",
-        # Path to params JSON (architecture config). Defaults to bundled
-        # config/lfm2_5_vl_1_6b_config.json if not provided.
         params_path: Optional[str] = None,
     ):
         self.use_sdpa_with_kv_cache_op = use_sdpa_with_kv_cache_op
@@ -196,7 +194,6 @@ class Lfm2p5VlModel(EagerModelBase):
         self.max_seq_len = max_seq_len
         self.model_dir = model_dir
 
-        # Load architecture config from JSON (mirrors LLaMA model.py pattern)
         resolved_params = params_path or _DEFAULT_PARAMS
         with open(resolved_params, "r") as f:
             params = json.loads(f.read())
@@ -205,10 +202,9 @@ class Lfm2p5VlModel(EagerModelBase):
             max_batch_size=1,
             max_seq_len=max_seq_len,
             max_context_len=max_context_len,
-            use_kv_cache=True,
+            use_kv_cache=use_kv_cache,
             use_sdpa_with_kv_cache_op=use_sdpa_with_kv_cache_op,
-            # CRITICAL: False avoids .item() in rope.get_freqs which crashes
-            # FakeTensor export via to_edge_transform_and_lower
+            # False avoids .item() in rope.get_freqs during FakeTensor export
             enable_dynamic_shape=False,
             **params,
         )

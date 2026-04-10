@@ -5,11 +5,11 @@
 # LICENSE file in the root directory of this source tree.
 
 """
-Export LFM2.5-VL as a single multi-method PTE for ExecuTorch.
+Export LFM2.5-VL as a single multi-method PTE for ExecuTorch with CUDA backend.
 
-Vision encoder and token embedding are delegated to the CUDA backend (AOTI);
-text decoder falls back to XNNPack because its hybrid conv layers use mutable
-buffers that AOTI cannot re-trace (PendingUnbackedSymbolNotFound).
+All three methods (vision encoder, token embedding, text decoder) are delegated
+to the CUDA/AOTI backend.  Conv layer state is passed as explicit IO rather
+than mutable buffers, which AOTI cannot re-trace.
 
 Supports both checkpoint sizes:
   - LiquidAI/LFM2-VL-1.6B  (text dim 2048)
@@ -36,7 +36,6 @@ from torch.nn.attention import SDPBackend
 
 from executorch.backends.cuda.cuda_backend import CudaBackend
 from executorch.backends.cuda.cuda_partitioner import CudaPartitioner
-from executorch.backends.xnnpack.partition.xnnpack_partitioner import XnnpackPartitioner
 from executorch.exir import (
     EdgeCompileConfig,
     ExecutorchBackendConfig,
@@ -116,32 +115,58 @@ def export_image_encoder(lfm2) -> torch.export.ExportedProgram:
 def export_text_decoder(
     lfm2, dtype: torch.dtype = torch.bfloat16
 ) -> torch.export.ExportedProgram:
-    """Export hybrid LFM2.5 decoder: (embeddings, input_pos) -> logits."""
+    """Export hybrid LFM2.5 decoder: (embeddings, input_pos) -> logits.
+
+    Conv states are initialised as zeros inside the forward pass and
+    threaded through layers via attn_options["conv_states"].  This avoids
+    register_buffer mutations that AOTI cannot re-trace.
+    """
+    from executorch.examples.models.lfm2.short_conv import ShortConvBlock
+
+    conv_layer_indices = [
+        i for i, layer in enumerate(lfm2.text_model.layers)
+        if isinstance(layer, ShortConvBlock)
+    ]
 
     class TextDecoder(torch.nn.Module):
-        def __init__(self, text_model):
+        def __init__(self, text_model, conv_dim, conv_L_cache, conv_indices):
             super().__init__()
             self.text_model = text_model
+            self.conv_dim = conv_dim
+            self.conv_L_cache = conv_L_cache
+            self.conv_indices = conv_indices
 
         def forward(
             self, embeddings: torch.Tensor, input_pos: torch.Tensor
         ) -> torch.Tensor:
-            return self.text_model(None, {"input_pos": input_pos}, embeddings)
+            conv_states = {
+                idx: torch.zeros(
+                    1, self.conv_dim, self.conv_L_cache - 1,
+                    dtype=embeddings.dtype, device=embeddings.device,
+                )
+                for idx in self.conv_indices
+            }
+            attn_options = {"conv_states": conv_states}
+            if self.text_model.use_kv_cache:
+                attn_options["input_pos"] = input_pos
+            return self.text_model(None, attn_options, embeddings)
 
-    decoder = TextDecoder(lfm2.text_model)
+    decoder = TextDecoder(
+        lfm2.text_model,
+        conv_dim=lfm2.text_model_args.dim,
+        conv_L_cache=3,
+        conv_indices=conv_layer_indices,
+    )
     dim = lfm2.text_model_args.dim
     dummy_seq = 8
     dummy_embeddings = torch.randn(1, dummy_seq, dim, dtype=dtype)
     dummy_input_pos = torch.arange(dummy_seq, dtype=torch.int64)
-    token_dim = Dim("token_dim", min=1, max=MAX_SEQ_LEN)
-    dynamic_shapes = ({1: token_dim}, {0: token_dim})
 
     logging.info("Exporting text decoder...")
     with torch.nn.attention.sdpa_kernel([SDPBackend.MATH]), torch.no_grad():
         return torch.export.export(
             decoder,
             (dummy_embeddings, dummy_input_pos),
-            dynamic_shapes=dynamic_shapes,
             strict=False,
         )
 
@@ -180,6 +205,12 @@ def export_all(
         max_seq_len=max_seq_len,
         max_context_len=max_context_len,
         params_path=params_path,
+        # Disable XNNPack-specific source transforms and KV cache.  The native
+        # KVCache + custom SDPA use mutable register_buffer state that creates
+        # unbacked symbols AOTI cannot re-trace.  For CUDA we rely on AOTI's
+        # own SDPA kernels; KV caching is not yet supported on this path.
+        use_sdpa_with_kv_cache_op=False,
+        use_kv_cache=False,
     )
     # Export on CPU — the emitter reads tensor bytes via ctypes pointer,
     # which segfaults if the storage lives on CUDA.
@@ -200,17 +231,10 @@ def export_all(
         "text_decoder": decoder_ep,
     }
 
-    # HACK: text_decoder uses XNNPack instead of CUDA because ShortConv's
-    # mutable conv_state buffers produce unbacked symbols that AOTI cannot
-    # re-trace. To fix properly, convert conv_state from register_buffer to
-    # explicit forward IO (state-as-IO pattern).
     partitioners = {}
     for key in exported_programs:
-        if key == "text_decoder":
-            partitioners[key] = [XnnpackPartitioner()]
-        else:
-            compile_specs = [CudaBackend.generate_method_name_compile_spec(key)]
-            partitioners[key] = [CudaPartitioner(compile_specs)]
+        compile_specs = [CudaBackend.generate_method_name_compile_spec(key)]
+        partitioners[key] = [CudaPartitioner(compile_specs)]
 
     metadata = {
         "get_max_seq_len": lfm2.text_model_args.max_seq_len,

@@ -351,6 +351,7 @@ def construct_transformer(model_args: ModelArgs) -> Transformer:
                     dim=model_args.dim,
                     hidden_dim=model_args.hidden_dim,
                     norm_eps=model_args.norm_eps,
+                    layer_idx=layer_id,
                 )
             )
         elif (

@@ -590,7 +590,7 @@ class AttentionMHA(Attention):
 
         assert hasattr(self, "mask")
 
-        mask = self.mask[:seqlen, :seqlen]
+        mask = self.mask[:seqlen, :seqlen].unsqueeze(0).unsqueeze(0)
 
         output = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, dropout_p=0.0)
 

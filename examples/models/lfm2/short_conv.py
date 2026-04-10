@@ -28,18 +28,10 @@ class ShortConv(nn.Module):
             dim,
             dim,
             kernel_size=L_cache,
-            padding=0,  ## we don't need padding since we handle it manually
+            padding=0,
             groups=dim,
             bias=bias,
         )
-
-        conv_state = torch.zeros(
-            1,  ## batch size is assumed to be 1 for now
-            dim,
-            L_cache - 1,
-            device="cpu",
-        )
-        self.register_buffer("conv_state", conv_state)
 
         ## better performance in Executorch with separate projections
         self.B_proj = nn.Linear(dim, dim, bias=bias)
@@ -48,52 +40,58 @@ class ShortConv(nn.Module):
 
         self.out_proj = nn.Linear(dim, dim, bias=bias)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        batch_size, seqlen, dim = x.size()
-        assert batch_size == 1, "batch_size must be 1"
+    def _make_empty_conv_state(self) -> torch.Tensor:
+        """Return a zero-initialised conv state: [1, dim, L_cache - 1]."""
+        return torch.zeros(
+            1, self.dim, self.L_cache - 1,
+            device=self.conv.weight.device,
+            dtype=self.conv.weight.dtype,
+        )
 
-        B = self.B_proj(x).transpose(-1, -2)  # (batch_size, dim, seq_len)
-        C = self.C_proj(x).transpose(-1, -2)  # (batch_size, dim, seq_len)
-        x = self.x_proj(x).transpose(-1, -2)  # (batch_size, dim, seq_len)
+    def forward(
+        self,
+        x: torch.Tensor,
+        conv_state: Optional[torch.Tensor] = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Args:
+            x: [batch_size, seq_len, dim]
+            conv_state: [batch_size, dim, L_cache - 1] or None for fresh state.
 
-        Bx = B * x  # (batch_size, dim, seq_len)
+        Returns:
+            (output, new_conv_state) — caller is responsible for persisting
+            the returned state between calls.
+        """
+        if conv_state is None:
+            conv_state = self._make_empty_conv_state()
 
-        ## This is where we handle padding
-        ## By default, the conv_state is initialized to 0.
-        #  So, assuming prefill is done on an empty cache, concatenating conv_state to the beginning of the sequence acts similary to
-        ## using nn.Conv1d(padding=L_cache-1) (for prefill) without no manual padding.
-        ## However, the manual padding has the added benefit of being correct during decode, when the cache is not initialized to 0.
-        Bx = torch.cat(
-            [self.conv_state, Bx], dim=-1
-        )  # (batch_size, dim, seq_len + L_cache - 1)
+        B = self.B_proj(x).transpose(-1, -2)
+        C = self.C_proj(x).transpose(-1, -2)
+        x = self.x_proj(x).transpose(-1, -2)
 
-        ## Update the conv_state
-        new_conv_state = Bx[
-            ..., -(self.L_cache - 1) :
-        ]  # (batch_size, dim, L_cache - 1)
-        with torch.no_grad():
-            self.conv_state.copy_(new_conv_state)
+        Bx = B * x
+        Bx = torch.cat([conv_state, Bx], dim=-1)
 
-        conv_out = self.conv(Bx)[..., : x.size(-1)]  # (batch_size, dim, seq_len)
-        y = C * conv_out  # (batch_size, dim, seq_len)
+        new_conv_state = Bx[..., -(self.L_cache - 1):]
 
-        y = y.transpose(-1, -2)  # (batch_size, seq_len, dim)
-        y = y.contiguous()  # (batch_size, seq_len, dim)
-        y = self.out_proj(y)  # (batch_size, seq_len, dim)
-        return y
+        conv_out = self.conv(Bx)[..., :x.size(-1)]
+        y = C * conv_out
 
-    def reset_cache(self):
-        self.conv_state.zero_()
+        y = y.transpose(-1, -2).contiguous()
+        y = self.out_proj(y)
+        return y, new_conv_state
 
 
 class ShortConvBlock(nn.Module):
-    def __init__(self, dim: int, hidden_dim: int, norm_eps: float):
+    def __init__(
+        self, dim: int, hidden_dim: int, norm_eps: float, layer_idx: int = -1
+    ):
         super().__init__()
-        self.L_cache = 3  # hardcode 3 for now
+        self.layer_idx = layer_idx
+        self.L_cache = 3
         self.conv = ShortConv(dim, self.L_cache, bias=False)
         self.feed_forward = FeedForward(dim, hidden_dim)
         self.ffn_norm = RMSNorm(dim, norm_eps)
-        # use attention_norm norm instead of operator_norm to unify with TransformerBlock
         self.attention_norm = RMSNorm(dim, norm_eps)
 
     def forward(
@@ -101,12 +99,24 @@ class ShortConvBlock(nn.Module):
         x,
         freqs_cos=None,
         freqs_sin=None,
-        _unused_attn_options: Optional[ForwardOptions] = None,
-    ):  # x: 1xN
-        h = self.conv.forward(self.attention_norm(x))
+        attn_options: Optional[ForwardOptions] = None,
+    ):
+        conv_state = None
+        if attn_options is not None:
+            conv_states = attn_options.get("conv_states")
+            if conv_states is not None:
+                conv_state = conv_states.get(self.layer_idx)
+
+        h, new_conv_state = self.conv.forward(self.attention_norm(x), conv_state)
         h = x + h
         out = h + self.feed_forward(self.ffn_norm(h))
-        return out, None
+
+        update = {}
+        if attn_options is not None and "conv_states" in attn_options:
+            states = dict(attn_options["conv_states"])
+            states[self.layer_idx] = new_conv_state
+            update["conv_states"] = states
+        return out, update
 
     def reset_cache(self):
-        self.conv.reset_cache()
+        pass
