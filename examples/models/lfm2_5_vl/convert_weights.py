@@ -4,34 +4,18 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""
-Convert LFM2.5-VL text decoder weights from HuggingFace safetensors format
-to the Meta/ET format expected by construct_transformer.
+"""Convert LFM2.5-VL text decoder weights from HuggingFace to ET format."""
 
-Usage:
-    python examples/models/lfm2_5_vl/convert_weights.py \
-        /path/to/LFM2-VL-1.6B \
-        lfm2_5_vl_1_6b.pt
-
-The input directory must contain model.safetensors from the HuggingFace
-LiquidAI/LFM2-VL-1.6B checkpoint. Only the language model (text decoder)
-weights are extracted — vision tower and projector weights are not included.
-"""
+from __future__ import annotations
 
 import argparse
-import os
-from typing import Dict
+from pathlib import Path
 
 import torch
-
 from executorch.examples.models.checkpoint import get_mapped_key
 from safetensors.torch import load_file
 
-# HuggingFace key -> ET/Meta key mapping for LFM2.5-VL language model.
-# Keys use {} as a placeholder for the layer index (handled by get_mapped_key).
-# The "model.language_model." prefix is specific to the VL wrapper; text-only
-# LFM2 uses "model." directly.
-_LFM2_5_VL_TO_META = {
+_LFM2_5_VL_TO_META: dict[str, str] = {
     "model.language_model.embed_tokens.weight": "tok_embeddings.weight",
     "model.language_model.embedding_norm.weight": "norm.weight",
     "model.language_model.layers.{}.self_attn.q_proj.weight": "layers.{}.attention.wq.weight",
@@ -49,77 +33,45 @@ _LFM2_5_VL_TO_META = {
     "model.language_model.layers.{}.conv.out_proj.weight": "layers.{}.conv.out_proj.weight",
 }
 
+_IN_PROJ_SPLITS = ("B_proj", "C_proj", "x_proj")
 
-def lfm2_5_vl_to_meta(state_dict: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
-    """
-    Convert a state dict from LFM2.5-VL HF format to Meta's ET format.
-    Only extracts language model (text decoder) weights.
 
-    Args:
-        state_dict: State dict from model.safetensors (full VL model).
-
-    Returns:
-        State dict in ET construct_transformer format.
-    """
-    converted = {}
+def lfm2_5_vl_to_meta(state_dict: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+    """Extract and remap language model weights from a full VL state dict."""
+    converted: dict[str, torch.Tensor] = {}
 
     for key, value in state_dict.items():
-        # Skip vision tower and projector — not part of the text decoder
         if not key.startswith("model.language_model."):
             continue
 
         try:
             new_key = get_mapped_key(key, _LFM2_5_VL_TO_META)
         except Exception:
-            # Fallback: strip "model.language_model." prefix.
-            # This covers in_proj (handled below) and any passthrough keys.
             new_key = key.removeprefix("model.language_model.")
 
-        # Split conv in_proj: [3*dim, dim] -> B_proj, C_proj, x_proj each [dim, dim]
         if new_key.endswith(".conv.in_proj.weight"):
-            for name, split_value in zip(
-                ["B_proj", "C_proj", "x_proj"], torch.chunk(value, 3, dim=0)
-            ):
-                converted[new_key.replace("in_proj", name)] = split_value
+            for name, chunk in zip(_IN_PROJ_SPLITS, torch.chunk(value, 3, dim=0)):
+                converted[new_key.replace("in_proj", name)] = chunk
         else:
             converted[new_key] = value
 
-    # lm_head is not in safetensors (tied embeddings) — use tok_embeddings
     if "output.weight" not in converted:
         converted["output.weight"] = converted["tok_embeddings.weight"]
 
     return converted
 
 
-def load_checkpoint(input_dir: str) -> Dict:
-    print("Loading checkpoint from safetensors...")
-    return load_file(os.path.join(input_dir, "model.safetensors"))
-
-
 def convert_weights(input_dir: str, output_file: str) -> None:
-    print("Loading checkpoint...")
-    sd = load_checkpoint(input_dir)
-    print("Converting weights...")
+    sd = load_file(str(Path(input_dir) / "model.safetensors"))
     sd = lfm2_5_vl_to_meta(sd)
-    print("Saving checkpoint...")
     torch.save(sd, output_file)
     print(f"Saved {len(sd)} tensors to {output_file}")
 
 
-def main():
-    parser = argparse.ArgumentParser(
-        description="Convert LFM2.5-VL text decoder weights to Meta/ET format."
-    )
-    parser.add_argument(
-        "input_dir",
-        type=str,
-        help="Path to directory containing model.safetensors (HuggingFace LFM2-VL-1.6B).",
-    )
-    parser.add_argument(
-        "output",
-        type=str,
-        help="Path to the output .pt checkpoint file.",
-    )
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Convert LFM2.5-VL weights to ET format.")
+    parser.add_argument("input_dir", help="Directory containing model.safetensors.")
+    parser.add_argument("output", help="Output .pt checkpoint path.")
     args = parser.parse_args()
     convert_weights(args.input_dir, args.output)
 

@@ -5,33 +5,31 @@
 # LICENSE file in the root directory of this source tree.
 
 """
-Export LFM2.5-VL as a single multi-method PTE for ExecuTorch with CUDA backend.
+Export LFM2.5-VL as a multi-method PTE for ExecuTorch with CUDA/AOTI backend.
 
-All three methods (vision encoder, token embedding, text decoder) are delegated
-to the CUDA/AOTI backend.  Conv layer state is passed as explicit IO rather
-than mutable buffers, which AOTI cannot re-trace.
-
-Supports both checkpoint sizes:
-  - LiquidAI/LFM2-VL-1.6B  (text dim 2048)
-  - LiquidAI/LFM2.5-VL-450M (text dim 1024)
+All three methods are delegated to the CUDA backend.  Conv layer state is
+threaded through attn_options as explicit IO; KV cache uses mark_static_address
+so AOTI can trace through in-place mutations.
 
 Methods (D = text hidden dim):
   vision_encoder  : [1, 3, 512, 512] f32 -> [1, 256, D] f32
   token_embedding : [1, seq_len] i64     -> [1, seq_len, D] f32
-  text_decoder    : ([1, seq_len, D], [seq_len] i64) -> [1, 65536] f32
+  text_decoder    : ([1, seq_len, D], [seq_len] i64) -> [1, vocab] f32
 
 Usage:
     python examples/models/lfm2_5_vl/export_lfm2_5_vl.py \\
         --model_dir LiquidAI/LFM2.5-VL-450M --dtype bf16
 """
 
+from __future__ import annotations
+
 import logging
-import os
 from argparse import ArgumentParser
+from pathlib import Path
 from typing import Optional
 
 import torch
-from torch.export import Dim
+from torch.export import Dim, ExportedProgram
 from torch.nn.attention import SDPBackend
 
 from executorch.backends.cuda.cuda_backend import CudaBackend
@@ -45,18 +43,20 @@ from executorch.exir.passes import MemoryPlanningPass
 from executorch.exir.passes.sym_shape_eval_pass import ConstraintBasedSymShapeEvalPass
 
 from executorch.examples.models.lfm2_5_vl.model import (
-    Lfm2p5VlModel,
     IMAGE_SIZE,
     MAX_SEQ_LEN,
+    Lfm2p5VlModel,
 )
 
-FORMAT = "[%(levelname)s %(asctime)s %(filename)s:%(lineno)s] %(message)s"
-logging.basicConfig(level=logging.INFO, format=FORMAT)
+logging.basicConfig(
+    level=logging.INFO,
+    format="[%(levelname)s %(asctime)s %(filename)s:%(lineno)s] %(message)s",
+)
 
-# Workaround: torch._inductor maps arch 103 (Blackwell B300) to "100f",
-# but Triton generates PTX targeting sm_103a. The mismatch causes nvcc to
-# fail with "SM version specified by .target is higher than default SM
-# version assumed". Patch the mapping so nvcc -gencode matches the PTX.
+# ---------------------------------------------------------------------------
+# Blackwell (sm_103) workaround: torch._inductor maps arch 103 -> "100f" but
+# Triton generates PTX targeting sm_103a.  Patch to match.
+# ---------------------------------------------------------------------------
 from torch._inductor.codecache import cuda_compile_utils
 
 _orig_nvcc_arch = cuda_compile_utils._nvcc_arch_as_compile_option
@@ -64,278 +64,177 @@ _orig_nvcc_arch = cuda_compile_utils._nvcc_arch_as_compile_option
 
 def _patched_nvcc_arch() -> str:
     arch = cuda_compile_utils.cuda_env.get_cuda_arch()
-    if arch == "103":
-        return "103a"
-    return _orig_nvcc_arch()
+    return "103a" if arch == "103" else _orig_nvcc_arch()
 
 
 cuda_compile_utils._nvcc_arch_as_compile_option = _patched_nvcc_arch
 
-import torch._inductor.config as inductor_config
-inductor_config.max_autotune_conv_backends = "ATEN,TRITON"
+_CONFIG_DIR = Path(__file__).parent / "config"
 
-_CONFIG_DIR = os.path.join(os.path.dirname(__file__), "config")
+_DTYPE_MAP: dict[str, torch.dtype] = {
+    "fp32": torch.float32,
+    "fp16": torch.float16,
+    "bf16": torch.bfloat16,
+}
 
 
-def _resolve_params_path(model_dir: str, params: Optional[str]) -> Optional[str]:
-    """Pick a bundled config based on model_dir if --params was not provided."""
+def _resolve_params_path(model_dir: str, params: str | None) -> str | None:
     if params is not None:
         return params
     name = model_dir.lower()
     if "450m" in name:
-        return os.path.join(_CONFIG_DIR, "lfm2_5_vl_450m_config.json")
+        return str(_CONFIG_DIR / "lfm2_5_vl_450m_config.json")
     if "1.6b" in name or "1_6b" in name:
-        return os.path.join(_CONFIG_DIR, "lfm2_5_vl_1_6b_config.json")
+        return str(_CONFIG_DIR / "lfm2_5_vl_1_6b_config.json")
     return None
 
 
 # ---------------------------------------------------------------------------
-# Per-method export helpers
+# Per-method export
 # ---------------------------------------------------------------------------
 
 
-def export_image_encoder(lfm2, device="cuda") -> torch.export.ExportedProgram:
-    """Export vision encoder: [1,3,512,512] f32 pixels [0,255] -> [1,256,D] f32."""
-
-    class ImageEncoder(torch.nn.Module):
-        def __init__(self, lfm2):
+def _export_image_encoder(lfm2: torch.nn.Module, *, device: str) -> ExportedProgram:
+    class _Encoder(torch.nn.Module):
+        def __init__(self, lfm2: torch.nn.Module) -> None:
             super().__init__()
             self.lfm2 = lfm2
 
         def forward(self, images: torch.Tensor) -> torch.Tensor:
             return self.lfm2.image_embedding(images)
 
-    encoder = ImageEncoder(lfm2)
-    example_pixels = torch.randint(
-        0, 256, (1, 3, IMAGE_SIZE, IMAGE_SIZE), dtype=torch.float32, device=device
-    )
-
-    logging.info("Exporting vision encoder...")
+    example = torch.randint(0, 256, (1, 3, IMAGE_SIZE, IMAGE_SIZE), dtype=torch.float32, device=device)
     with torch.nn.attention.sdpa_kernel([SDPBackend.MATH]), torch.no_grad():
-        return torch.export.export(encoder, (example_pixels,), strict=False)
+        return torch.export.export(_Encoder(lfm2), (example,), strict=False)
 
 
-def export_text_decoder(
-    lfm2, dtype: torch.dtype = torch.bfloat16, device="cuda"
-) -> torch.export.ExportedProgram:
-    """Export hybrid LFM2.5 decoder: (embeddings, input_pos) -> logits.
-
-    Conv states are initialised as zeros inside the forward pass and
-    threaded through layers via attn_options["conv_states"].  This avoids
-    register_buffer mutations that AOTI cannot re-trace.
-    """
+def _export_text_decoder(lfm2: torch.nn.Module, *, dtype: torch.dtype, device: str) -> ExportedProgram:
     from executorch.examples.models.lfm2.short_conv import ShortConvBlock
 
-    conv_layer_indices = [
-        i for i, layer in enumerate(lfm2.text_model.layers)
-        if isinstance(layer, ShortConvBlock)
-    ]
+    conv_indices = [i for i, layer in enumerate(lfm2.text_model.layers) if isinstance(layer, ShortConvBlock)]
+    dim = lfm2.text_model_args.dim
 
-    class TextDecoder(torch.nn.Module):
-        def __init__(self, text_model, conv_dim, conv_L_cache, conv_indices):
+    class _Decoder(torch.nn.Module):
+        def __init__(self, text_model: torch.nn.Module, conv_dim: int, conv_indices: list[int]) -> None:
             super().__init__()
             self.text_model = text_model
             self.conv_dim = conv_dim
-            self.conv_L_cache = conv_L_cache
             self.conv_indices = conv_indices
 
-        def forward(
-            self, embeddings: torch.Tensor, input_pos: torch.Tensor
-        ) -> torch.Tensor:
+        def forward(self, embeddings: torch.Tensor, input_pos: torch.Tensor) -> torch.Tensor:
             conv_states = {
-                idx: torch.zeros(
-                    1, self.conv_dim, self.conv_L_cache - 1,
-                    dtype=embeddings.dtype, device=embeddings.device,
-                )
+                idx: torch.zeros(1, self.conv_dim, 2, dtype=embeddings.dtype, device=embeddings.device)
                 for idx in self.conv_indices
             }
-            attn_options = {
-                "input_pos": input_pos,
-                "conv_states": conv_states,
-            }
-            out = self.text_model(None, attn_options, embeddings)
+            out = self.text_model(None, {"input_pos": input_pos, "conv_states": conv_states}, embeddings)
             if isinstance(out, tuple):
                 out = out[0]
             return out.contiguous()
 
-    decoder = TextDecoder(
-        lfm2.text_model,
-        conv_dim=lfm2.text_model_args.dim,
-        conv_L_cache=3,
-        conv_indices=conv_layer_indices,
-    )
-    dim = lfm2.text_model_args.dim
-    dummy_seq = 8
-    dummy_embeddings = torch.randn(1, dummy_seq, dim, dtype=dtype, device=device)
-    dummy_input_pos = torch.arange(dummy_seq, dtype=torch.int64, device=device)
+    seq = 8
     token_dim = Dim("token_dim", min=2, max=MAX_SEQ_LEN - 1)
-    dynamic_shapes = ({1: token_dim}, {0: token_dim})
+    example_emb = torch.randn(1, seq, dim, dtype=dtype, device=device)
+    example_pos = torch.arange(seq, dtype=torch.int64, device=device)
 
-    logging.info("Exporting text decoder...")
     with torch.nn.attention.sdpa_kernel([SDPBackend.MATH]), torch.no_grad():
         return torch.export._trace._export(
-            decoder,
-            (dummy_embeddings, dummy_input_pos),
-            dynamic_shapes=dynamic_shapes,
+            _Decoder(lfm2.text_model, dim, conv_indices),
+            (example_emb, example_pos),
+            dynamic_shapes=({1: token_dim}, {0: token_dim}),
             strict=False,
             prefer_deferred_runtime_asserts_over_guards=True,
         )
 
 
-def export_token_embedding(lfm2, device="cuda") -> torch.export.ExportedProgram:
-    """Export token embedding table: [1, seq_len] i64 -> [1, seq_len, D] f32."""
-    embed_module = lfm2.model_.model.language_model.get_input_embeddings()
+def _export_token_embedding(lfm2: torch.nn.Module, *, device: str) -> ExportedProgram:
+    embed = lfm2.model_.model.language_model.get_input_embeddings()
     token_dim = Dim("token_dim_1", min=1, max=MAX_SEQ_LEN)
-    dynamic_shapes = [{1: token_dim}]
-    example_ids = torch.zeros(1, MAX_SEQ_LEN, dtype=torch.int64, device=device)
-
-    logging.info("Exporting token embedding...")
+    example = torch.zeros(1, MAX_SEQ_LEN, dtype=torch.int64, device=device)
     with torch.no_grad():
-        return torch.export.export(
-            embed_module, (example_ids,), dynamic_shapes=dynamic_shapes, strict=False
-        )
+        return torch.export.export(embed, (example,), dynamic_shapes=[{1: token_dim}], strict=False)
 
 
 # ---------------------------------------------------------------------------
-# Main export pipeline
+# Pipeline
 # ---------------------------------------------------------------------------
 
 
 def export_all(
     model_dir: str,
-    output: Optional[str],
+    output: str,
+    *,
     dtype: torch.dtype = torch.bfloat16,
     max_seq_len: int = MAX_SEQ_LEN,
-    max_context_len: int = MAX_SEQ_LEN,
-    params_path: Optional[str] = None,
-    _return_program: bool = False,
-):
-    logging.info(f"Loading {model_dir}...")
+    params_path: str | None = None,
+) -> None:
+    logging.info("Loading %s...", model_dir)
     lfm2_model = Lfm2p5VlModel(
         model_dir=model_dir,
         max_seq_len=max_seq_len,
-        max_context_len=max_context_len,
+        max_context_len=max_seq_len,
         params_path=params_path,
-        # Disable XNNPack-specific custom SDPA.  For CUDA we rely on AOTI's
-        # own SDPA kernels.  KV cache uses mark_static_address so AOTI can
-        # trace through the in-place index_put mutations.
         use_sdpa_with_kv_cache_op=False,
     )
     lfm2 = lfm2_model.get_eager_model().to(dtype=dtype, device="cuda")
 
-    logging.info("[1/3] Exporting vision encoder...")
-    vision_ep = export_image_encoder(lfm2, device="cuda")
+    logging.info("[1/3] Vision encoder")
+    vision_ep = _export_image_encoder(lfm2, device="cuda")
+    logging.info("[2/3] Text decoder")
+    decoder_ep = _export_text_decoder(lfm2, dtype=dtype, device="cuda")
+    logging.info("[3/3] Token embedding")
+    token_ep = _export_token_embedding(lfm2, device="cuda")
 
-    logging.info("[2/3] Exporting text decoder...")
-    decoder_ep = export_text_decoder(lfm2, dtype=dtype, device="cuda")
-
-    logging.info("[3/3] Exporting token embedding...")
-    token_ep = export_token_embedding(lfm2, device="cuda")
-
-    exported_programs = {
-        "vision_encoder": vision_ep,
-        "token_embedding": token_ep,
-        "text_decoder": decoder_ep,
+    programs = {"vision_encoder": vision_ep, "token_embedding": token_ep, "text_decoder": decoder_ep}
+    partitioners = {
+        k: [CudaPartitioner([CudaBackend.generate_method_name_compile_spec(k)])]
+        for k in programs
     }
-
-    partitioners = {}
-    for key in exported_programs:
-        compile_specs = [CudaBackend.generate_method_name_compile_spec(key)]
-        partitioners[key] = [CudaPartitioner(compile_specs)]
-
     metadata = {
         "get_max_seq_len": lfm2.text_model_args.max_seq_len,
-        "get_max_context_len": lfm2.text_model_args.max_context_len,
-        "get_n_layers": lfm2.text_model_args.n_layers,
         "get_vocab_size": lfm2.text_model_args.vocab_size,
         "use_kv_cache": lfm2.text_model_args.use_kv_cache,
-        "use_sdpa_with_kv_cache": lfm2.text_model_args.use_sdpa_with_kv_cache_op,
-        "enable_dynamic_shape": lfm2.text_model_args.enable_dynamic_shape,
         "get_eos_ids": [7],
     }
 
-    logging.info("Lowering to Edge IR...")
+    logging.info("Lowering to Edge IR + CUDA")
     et_prog = to_edge_transform_and_lower(
-        exported_programs,
+        programs,
         partitioner=partitioners,
-        compile_config=EdgeCompileConfig(
-            _check_ir_validity=False,
-            _skip_dim_order=True,
-        ),
+        compile_config=EdgeCompileConfig(_check_ir_validity=False, _skip_dim_order=True),
         constant_methods=metadata,
     )
 
-    logging.info("Finalizing ExecuTorch program...")
+    logging.info("Finalizing ExecuTorch program")
     et_program = et_prog.to_executorch(
         ExecutorchBackendConfig(
             memory_planning_pass=MemoryPlanningPass(alloc_graph_input=False),
-            sym_shape_eval_pass={
-                "vision_encoder": ConstraintBasedSymShapeEvalPass(),
-                "token_embedding": ConstraintBasedSymShapeEvalPass(),
-                "text_decoder": ConstraintBasedSymShapeEvalPass(),
-            },
+            sym_shape_eval_pass={k: ConstraintBasedSymShapeEvalPass() for k in programs},
         )
     )
 
-    for plan in et_program._emitter_output.program.execution_plan:
-        logging.info(f"Activation memory: {plan.non_const_buffer_sizes}")
-
-    if _return_program:
-        return et_program
-
-    import os
-    output_dir = os.path.dirname(output) or "."
-    logging.info(f"Saving {output}...")
-    with open(output, "wb") as f:
+    output_path = Path(output)
+    output_dir = output_path.parent or Path(".")
+    logging.info("Saving %s", output_path)
+    with open(output_path, "wb") as f:
         et_program.write_to_file(f)
-    et_program.write_tensor_data_to_file(output_dir)
-    logging.info(f"Saved {output} — methods: {et_program.methods}")
+    et_program.write_tensor_data_to_file(str(output_dir))
+    logging.info("Done — methods: %s", et_program.methods)
 
 
-def main():
-    parser = ArgumentParser(description="Export LFM2.5-VL to ExecuTorch")
-    parser.add_argument(
-        "--model_dir",
-        default="LiquidAI/LFM2.5-VL-450M",
-        help="HuggingFace model ID or local path.",
-    )
-    parser.add_argument(
-        "--dtype",
-        default="bf16",
-        choices=["fp32", "fp16", "bf16"],
-        help="Model dtype (default: bf16)",
-    )
-    parser.add_argument(
-        "--max_seq_len",
-        type=int,
-        default=MAX_SEQ_LEN,
-        help=f"Maximum sequence length (default: {MAX_SEQ_LEN})",
-    )
-    parser.add_argument(
-        "--params",
-        default=None,
-        help="Path to model params JSON (architecture config).",
-    )
-    parser.add_argument(
-        "--output",
-        default=None,
-        help="Output PTE path (default: lfm2_5_vl_<dtype>_cuda.pte)",
-    )
+def main() -> None:
+    parser = ArgumentParser(description="Export LFM2.5-VL to ExecuTorch (CUDA)")
+    parser.add_argument("--model_dir", default="LiquidAI/LFM2.5-VL-450M")
+    parser.add_argument("--dtype", default="bf16", choices=list(_DTYPE_MAP))
+    parser.add_argument("--max_seq_len", type=int, default=MAX_SEQ_LEN)
+    parser.add_argument("--params", default=None)
+    parser.add_argument("--output", default=None)
     args = parser.parse_args()
 
-    dtype_map = {"fp32": torch.float32, "fp16": torch.float16, "bf16": torch.bfloat16}
-    dtype = dtype_map[args.dtype]
+    dtype = _DTYPE_MAP[args.dtype]
     params_path = _resolve_params_path(args.model_dir, args.params)
     output = args.output or f"lfm2_5_vl_{args.dtype}_cuda.pte"
 
-    export_all(
-        args.model_dir,
-        output,
-        dtype,
-        args.max_seq_len,
-        args.max_seq_len,
-        params_path,
-    )
+    export_all(args.model_dir, output, dtype=dtype, max_seq_len=args.max_seq_len, params_path=params_path)
 
 
 if __name__ == "__main__":
