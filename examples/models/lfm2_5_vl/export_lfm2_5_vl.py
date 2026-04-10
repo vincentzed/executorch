@@ -71,6 +71,9 @@ def _patched_nvcc_arch() -> str:
 
 cuda_compile_utils._nvcc_arch_as_compile_option = _patched_nvcc_arch
 
+import torch._inductor.config as inductor_config
+inductor_config.max_autotune_conv_backends = "ATEN,TRITON"
+
 _CONFIG_DIR = os.path.join(os.path.dirname(__file__), "config")
 
 
@@ -91,7 +94,7 @@ def _resolve_params_path(model_dir: str, params: Optional[str]) -> Optional[str]
 # ---------------------------------------------------------------------------
 
 
-def export_image_encoder(lfm2) -> torch.export.ExportedProgram:
+def export_image_encoder(lfm2, device="cuda") -> torch.export.ExportedProgram:
     """Export vision encoder: [1,3,512,512] f32 pixels [0,255] -> [1,256,D] f32."""
 
     class ImageEncoder(torch.nn.Module):
@@ -104,7 +107,7 @@ def export_image_encoder(lfm2) -> torch.export.ExportedProgram:
 
     encoder = ImageEncoder(lfm2)
     example_pixels = torch.randint(
-        0, 256, (1, 3, IMAGE_SIZE, IMAGE_SIZE), dtype=torch.float32
+        0, 256, (1, 3, IMAGE_SIZE, IMAGE_SIZE), dtype=torch.float32, device=device
     )
 
     logging.info("Exporting vision encoder...")
@@ -113,7 +116,7 @@ def export_image_encoder(lfm2) -> torch.export.ExportedProgram:
 
 
 def export_text_decoder(
-    lfm2, dtype: torch.dtype = torch.bfloat16
+    lfm2, dtype: torch.dtype = torch.bfloat16, device="cuda"
 ) -> torch.export.ExportedProgram:
     """Export hybrid LFM2.5 decoder: (embeddings, input_pos) -> logits.
 
@@ -149,7 +152,10 @@ def export_text_decoder(
             attn_options = {"conv_states": conv_states}
             if self.text_model.use_kv_cache:
                 attn_options["input_pos"] = input_pos
-            return self.text_model(None, attn_options, embeddings)
+            out = self.text_model(None, attn_options, embeddings)
+            if isinstance(out, tuple):
+                out = out[0]
+            return out.contiguous()
 
     decoder = TextDecoder(
         lfm2.text_model,
@@ -159,24 +165,28 @@ def export_text_decoder(
     )
     dim = lfm2.text_model_args.dim
     dummy_seq = 8
-    dummy_embeddings = torch.randn(1, dummy_seq, dim, dtype=dtype)
-    dummy_input_pos = torch.arange(dummy_seq, dtype=torch.int64)
+    dummy_embeddings = torch.randn(1, dummy_seq, dim, dtype=dtype, device=device)
+    dummy_input_pos = torch.arange(dummy_seq, dtype=torch.int64, device=device)
+    token_dim = Dim("token_dim", min=2, max=MAX_SEQ_LEN - 1)
+    dynamic_shapes = ({1: token_dim}, {0: token_dim})
 
     logging.info("Exporting text decoder...")
     with torch.nn.attention.sdpa_kernel([SDPBackend.MATH]), torch.no_grad():
-        return torch.export.export(
+        return torch.export._trace._export(
             decoder,
             (dummy_embeddings, dummy_input_pos),
+            dynamic_shapes=dynamic_shapes,
             strict=False,
+            prefer_deferred_runtime_asserts_over_guards=True,
         )
 
 
-def export_token_embedding(lfm2) -> torch.export.ExportedProgram:
+def export_token_embedding(lfm2, device="cuda") -> torch.export.ExportedProgram:
     """Export token embedding table: [1, seq_len] i64 -> [1, seq_len, D] f32."""
     embed_module = lfm2.model_.model.language_model.get_input_embeddings()
     token_dim = Dim("token_dim_1", min=1, max=MAX_SEQ_LEN)
     dynamic_shapes = [{1: token_dim}]
-    example_ids = torch.zeros(1, MAX_SEQ_LEN, dtype=torch.int64)
+    example_ids = torch.zeros(1, MAX_SEQ_LEN, dtype=torch.int64, device=device)
 
     logging.info("Exporting token embedding...")
     with torch.no_grad():
@@ -212,18 +222,16 @@ def export_all(
         use_sdpa_with_kv_cache_op=False,
         use_kv_cache=False,
     )
-    # Export on CPU — the emitter reads tensor bytes via ctypes pointer,
-    # which segfaults if the storage lives on CUDA.
-    lfm2 = lfm2_model.get_eager_model().to(dtype=dtype)
+    lfm2 = lfm2_model.get_eager_model().to(dtype=dtype, device="cuda")
 
     logging.info("[1/3] Exporting vision encoder...")
-    vision_ep = export_image_encoder(lfm2)
+    vision_ep = export_image_encoder(lfm2, device="cuda")
 
     logging.info("[2/3] Exporting text decoder...")
-    decoder_ep = export_text_decoder(lfm2, dtype=dtype)
+    decoder_ep = export_text_decoder(lfm2, dtype=dtype, device="cuda")
 
     logging.info("[3/3] Exporting token embedding...")
-    token_ep = export_token_embedding(lfm2)
+    token_ep = export_token_embedding(lfm2, device="cuda")
 
     exported_programs = {
         "vision_encoder": vision_ep,
@@ -276,9 +284,12 @@ def export_all(
     if _return_program:
         return et_program
 
+    import os
+    output_dir = os.path.dirname(output) or "."
     logging.info(f"Saving {output}...")
     with open(output, "wb") as f:
         et_program.write_to_file(f)
+    et_program.write_tensor_data_to_file(output_dir)
     logging.info(f"Saved {output} — methods: {et_program.methods}")
 
 

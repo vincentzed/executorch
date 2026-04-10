@@ -74,7 +74,14 @@ class ShortConv(nn.Module):
 
         new_conv_state = Bx[..., -(self.L_cache - 1):]
 
-        conv_out = self.conv(Bx)[..., :x.size(-1)]
+        # Manual depthwise conv: Triton has no template for nn.Conv1d with
+        # groups=dim and dynamic seq_len.  kernel_size is always 3.
+        w = self.conv.weight[:, 0, :]  # [dim, 3]
+        conv_out = (
+            Bx[..., :-2] * w[:, 0:1]
+            + Bx[..., 1:-1] * w[:, 1:2]
+            + Bx[..., 2:] * w[:, 2:3]
+        )
         y = C * conv_out
 
         y = y.transpose(-1, -2).contiguous()
