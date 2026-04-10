@@ -57,17 +57,18 @@ logging.basicConfig(
 # Blackwell (sm_103) workaround: torch._inductor maps arch 103 -> "100f" but
 # Triton generates PTX targeting sm_103a.  Patch to match.
 # ---------------------------------------------------------------------------
-from torch._inductor.codecache import cuda_compile_utils
+try:
+    from torch._inductor.codecache import cuda_compile_utils
 
-_orig_nvcc_arch = cuda_compile_utils._nvcc_arch_as_compile_option
+    _orig_nvcc_arch = cuda_compile_utils._nvcc_arch_as_compile_option
 
+    def _patched_nvcc_arch() -> str:
+        arch = cuda_compile_utils.cuda_env.get_cuda_arch()
+        return "103a" if arch == "103" else _orig_nvcc_arch()
 
-def _patched_nvcc_arch() -> str:
-    arch = cuda_compile_utils.cuda_env.get_cuda_arch()
-    return "103a" if arch == "103" else _orig_nvcc_arch()
-
-
-cuda_compile_utils._nvcc_arch_as_compile_option = _patched_nvcc_arch
+    cuda_compile_utils._nvcc_arch_as_compile_option = _patched_nvcc_arch
+except (ImportError, AttributeError):
+    pass
 
 _CONFIG_DIR = Path(__file__).parent / "config"
 
