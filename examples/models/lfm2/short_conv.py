@@ -79,6 +79,9 @@ class ShortConvBlock(nn.Module):
 
         update: dict = {}
         if attn_options is not None and "conv_states" in attn_options:
+            # Write back in-place if conv_state is a persistent buffer
+            if conv_state is not None:
+                conv_state.copy_(new_conv_state)
             states = dict(attn_options["conv_states"])
             states[self.layer_idx] = new_conv_state
             update["conv_states"] = states
