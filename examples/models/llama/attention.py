@@ -88,9 +88,6 @@ class KVCache(nn.Module):
         self.register_buffer(
             "v_cache", torch.zeros(cache_shape, dtype=dtype, device="cpu")
         )
-        if not torch.compiler.is_compiling():
-            torch._dynamo.mark_static_address(self.k_cache)
-            torch._dynamo.mark_static_address(self.v_cache)
 
     def update(
         self, input_pos: torch.Tensor, k_val: torch.Tensor, v_val: torch.Tensor

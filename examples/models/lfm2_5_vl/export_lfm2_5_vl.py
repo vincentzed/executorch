@@ -177,6 +177,13 @@ def export_all(
     )
     lfm2 = lfm2_model.get_eager_model().to(dtype=dtype, device="cuda")
 
+    # Mark KV cache buffers as static addresses after device migration,
+    # so AOTI can trace through in-place index_put mutations.
+    for module in lfm2.text_model.modules():
+        for name, buf in module.named_buffers(recurse=False):
+            if name in ("k_cache", "v_cache"):
+                torch._dynamo.mark_static_address(buf)
+
     logging.info("[1/3] Vision encoder")
     vision_ep = _export_image_encoder(lfm2, device="cuda")
     logging.info("[2/3] Text decoder")
