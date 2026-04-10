@@ -132,7 +132,7 @@ def _export_text_decoder(lfm2: torch.nn.Module, *, dtype: torch.dtype, device: s
             return out.contiguous()
 
     seq = 8
-    token_dim = Dim("token_dim", min=2, max=MAX_SEQ_LEN - 1)
+    token_dim = Dim("token_dim", min=1, max=MAX_SEQ_LEN - 1)
     example_emb = torch.randn(1, seq, dim, dtype=dtype, device=device)
     example_pos = torch.arange(seq, dtype=torch.int64, device=device)
 
