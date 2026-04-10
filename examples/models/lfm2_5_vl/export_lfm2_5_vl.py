@@ -114,15 +114,22 @@ def _export_text_decoder(lfm2: torch.nn.Module, *, dtype: torch.dtype, device: s
     dim = lfm2.text_model_args.dim
 
     class _Decoder(torch.nn.Module):
-        def __init__(self, text_model: torch.nn.Module, conv_dim: int, conv_indices: list[int]) -> None:
+        def __init__(
+            self, text_model: torch.nn.Module, conv_dim: int, conv_indices: list[int],
+            *, dtype: torch.dtype, device: str,
+        ) -> None:
             super().__init__()
             self.text_model = text_model
-            self.conv_dim = conv_dim
             self.conv_indices = conv_indices
+            for idx in conv_indices:
+                buf = torch.zeros(1, conv_dim, 2, dtype=dtype, device=device)
+                self.register_buffer(f"conv_state_{idx}", buf, persistent=False)
+                if not torch.compiler.is_compiling():
+                    torch._dynamo.mark_static_address(buf)
 
         def forward(self, embeddings: torch.Tensor, input_pos: torch.Tensor) -> torch.Tensor:
             conv_states = {
-                idx: torch.zeros(1, self.conv_dim, 2, dtype=embeddings.dtype, device=embeddings.device)
+                idx: getattr(self, f"conv_state_{idx}")
                 for idx in self.conv_indices
             }
             out = self.text_model(None, {"input_pos": input_pos, "conv_states": conv_states}, embeddings)
@@ -137,7 +144,7 @@ def _export_text_decoder(lfm2: torch.nn.Module, *, dtype: torch.dtype, device: s
 
     with torch.nn.attention.sdpa_kernel([SDPBackend.MATH]), torch.no_grad():
         return torch.export._trace._export(
-            _Decoder(lfm2.text_model, dim, conv_indices),
+            _Decoder(lfm2.text_model, dim, conv_indices, dtype=dtype, device=device),
             (example_emb, example_pos),
             dynamic_shapes=({1: token_dim}, {0: token_dim}),
             strict=False,
