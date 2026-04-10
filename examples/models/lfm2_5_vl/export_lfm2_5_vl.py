@@ -149,9 +149,10 @@ def export_text_decoder(
                 )
                 for idx in self.conv_indices
             }
-            attn_options = {"conv_states": conv_states}
-            if self.text_model.use_kv_cache:
-                attn_options["input_pos"] = input_pos
+            attn_options = {
+                "input_pos": input_pos,
+                "conv_states": conv_states,
+            }
             out = self.text_model(None, attn_options, embeddings)
             if isinstance(out, tuple):
                 out = out[0]
@@ -215,12 +216,10 @@ def export_all(
         max_seq_len=max_seq_len,
         max_context_len=max_context_len,
         params_path=params_path,
-        # Disable XNNPack-specific source transforms and KV cache.  The native
-        # KVCache + custom SDPA use mutable register_buffer state that creates
-        # unbacked symbols AOTI cannot re-trace.  For CUDA we rely on AOTI's
-        # own SDPA kernels; KV caching is not yet supported on this path.
+        # Disable XNNPack-specific custom SDPA.  For CUDA we rely on AOTI's
+        # own SDPA kernels.  KV cache uses mark_static_address so AOTI can
+        # trace through the in-place index_put mutations.
         use_sdpa_with_kv_cache_op=False,
-        use_kv_cache=False,
     )
     lfm2 = lfm2_model.get_eager_model().to(dtype=dtype, device="cuda")
 
